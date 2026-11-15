@@ -3,12 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   BookOpen, Award, CheckCircle2, XCircle, Clock, BarChart3, AlertTriangle, 
   Check, ChevronRight, RotateCcw, LogOut, LogIn, Play, FileText, HelpCircle, 
   ShieldCheck, TrendingUp, User, Bookmark, Sparkles, Menu, X, ArrowRight, ArrowLeft,
-  Flame, Target, Zap, Settings
+  Flame, Target, Zap, Settings, Terminal, Filter
 } from 'lucide-react';
 
 import { GoogleGenAI } from '@google/genai';
@@ -37,17 +37,18 @@ import {
 } from 'firebase/firestore';
 
 const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "AIzaSyDrl4zcqBOKgyHL0EJCwCqm2-TRDvdLkcU",
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "gen-lang-client-0238569127.firebaseapp.com",
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "gen-lang-client-0238569127",
+  firestoreDatabaseId: import.meta.env.VITE_FIRESTORE_DATABASE_ID || "ai-studio-747dfd0d-a1a9-49bc-8523-7fff2da8c448",
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || "gen-lang-client-0238569127.firebasestorage.app",
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "582174312052",
+  appId: import.meta.env.VITE_FIREBASE_APP_ID || "1:582174312052:web:a6a2ee032959beed72b321"
 };
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, import.meta.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID || '(default)');
+export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 const googleProvider = new GoogleAuthProvider();
 
@@ -125,6 +126,32 @@ interface MistakeItem {
   timestamp?: any;
 }
 
+interface LogEntry {
+  id?: string;
+  userId: string;
+  timestamp: any;
+  type: 'INBOUND' | 'OUTBOUND' | 'SYSTEM' | 'ERROR';
+  action: string;
+  details: string;
+  status: 'SUCCESS' | 'ERROR' | 'INFO';
+  statusCode: number;
+}
+
+// Recent questions tracker in localStorage to avoid repeating questions
+const getRecentQuestionIds = (): string[] => {
+  try {
+    return JSON.parse(localStorage.getItem('pet10_recent_question_ids') || '[]');
+  } catch {
+    return [];
+  }
+};
+
+const saveRecentQuestionIds = (ids: string[]) => {
+  try {
+    localStorage.setItem('pet10_recent_question_ids', JSON.stringify(ids.slice(-50)));
+  } catch {}
+};
+
 export default function App() {
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -147,17 +174,12 @@ export default function App() {
   });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [tempKeyInput, setTempKeyInput] = useState(userApiKey);
+  const [showInfoLogs, setShowInfoLogs] = useState(false); // Filter for INFO logs
 
-  const saveApiKey = () => {
-    localStorage.setItem('pet10_gemini_api_key', tempKeyInput.trim());
-    setUserApiKey(tempKeyInput.trim());
-    setSettingsOpen(false);
-    alert('Gemini API Key saved successfully! Quizzes will now be generated on the fly via AI.');
-  };
-
-  // Firestore data
+  // Firestore data & Logging state
   const [attempts, setAttempts] = useState<QuizAttempt[]>([]);
   const [mistakes, setMistakes] = useState<MistakeItem[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loadingData, setLoadingData] = useState(false);
 
   // Mistake practice mode state
@@ -166,26 +188,73 @@ export default function App() {
   const [mistakeAnswer, setMistakeAnswer] = useState<number | null>(null);
   const [mistakeFeedback, setMistakeFeedback] = useState<boolean | null>(null);
 
+  // Logger helper with HTTP status code
+  const logEvent = async (
+    type: 'INBOUND' | 'OUTBOUND' | 'SYSTEM' | 'ERROR', 
+    action: string, 
+    details: string, 
+    status: 'SUCCESS' | 'ERROR' | 'INFO' = 'SUCCESS',
+    statusCode: number = 200
+  ) => {
+    const logData: LogEntry = {
+      userId: user ? user.uid : 'anonymous',
+      timestamp: serverTimestamp(),
+      type,
+      action,
+      details,
+      status,
+      statusCode
+    };
+
+    // Update local state immediately
+    setLogs(prev => [{ ...logData, timestamp: new Date(), id: 'local_' + Date.now() + Math.random() }, ...prev]);
+
+    if (user) {
+      try {
+        await addDoc(collection(db, 'app_logs'), logData);
+      } catch (err) {
+        console.error('Failed to write log to Firestore:', err);
+      }
+    }
+  };
+
+  const saveApiKey = () => {
+    const trimmed = tempKeyInput.trim();
+    localStorage.setItem('pet10_gemini_api_key', trimmed);
+    setUserApiKey(trimmed);
+    setSettingsOpen(false);
+    logEvent('INBOUND', 'SAVE_API_KEY', 'User updated Gemini API key in settings', 'SUCCESS', 201);
+    alert('Gemini API Key saved successfully! Quizzes will now be generated on the fly via AI.');
+  };
+
   // Auth observer
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
       setAuthLoading(false);
+      if (currentUser) {
+        logEvent('SYSTEM', 'AUTH_STATE_CHANGE', `User logged in: ${currentUser.email || currentUser.uid}`, 'SUCCESS', 200);
+      } else {
+        logEvent('SYSTEM', 'AUTH_STATE_CHANGE', 'User logged out or anonymous', 'INFO', 204);
+      }
     });
     return () => unsubscribe();
   }, []);
 
-  // Fetch attempts and mistakes when user changes
+  // Fetch attempts, mistakes, and logs when user changes
   useEffect(() => {
     if (!user) {
       setAttempts([]);
       setMistakes([]);
+      setLogs([]);
       return;
     }
 
     setLoadingData(true);
     const fetchUserData = async () => {
       try {
+        logEvent('OUTBOUND', 'FETCH_USER_DATA', 'Fetching quiz attempts, mistake bank, and app logs from Firestore', 'INFO', 204);
+
         // Fetch quiz attempts
         const attemptsQuery = query(
           collection(db, 'quiz_attempts'),
@@ -196,7 +265,6 @@ export default function App() {
         attemptSnap.forEach(docSnap => {
           loadedAttempts.push({ id: docSnap.id, ...docSnap.data() } as QuizAttempt);
         });
-        // Sort client-side by timestamp descending
         loadedAttempts.sort((a, b) => {
           const tA = a.timestamp?.toMillis ? a.timestamp.toMillis() : (a.timestamp instanceof Date ? a.timestamp.getTime() : 0);
           const tB = b.timestamp?.toMillis ? b.timestamp.toMillis() : (b.timestamp instanceof Date ? b.timestamp.getTime() : 0);
@@ -215,8 +283,26 @@ export default function App() {
           loadedMistakes.push({ id: docSnap.id, ...docSnap.data() } as MistakeItem);
         });
         setMistakes(loadedMistakes);
+
+        // Fetch logs
+        const logsQuery = query(
+          collection(db, 'app_logs'),
+          where('userId', '==', user.uid)
+        );
+        const logSnap = await getDocs(logsQuery);
+        const loadedLogs: LogEntry[] = [];
+        logSnap.forEach(docSnap => {
+          loadedLogs.push({ id: docSnap.id, ...docSnap.data() } as LogEntry);
+        });
+        loadedLogs.sort((a, b) => {
+          const tA = a.timestamp?.toMillis ? a.timestamp.toMillis() : (a.timestamp instanceof Date ? a.timestamp.getTime() : 0);
+          const tB = b.timestamp?.toMillis ? b.timestamp.toMillis() : (b.timestamp instanceof Date ? b.timestamp.getTime() : 0);
+          return tB - tA;
+        });
+        setLogs(loadedLogs);
       } catch (err) {
-        handleFirestoreError(err, OperationType.LIST, 'quiz_attempts / mistake_bank');
+        handleFirestoreError(err, OperationType.LIST, 'quiz_attempts / mistake_bank / app_logs');
+        logEvent('ERROR', 'FETCH_USER_DATA_ERROR', String(err), 'ERROR', 500);
       } finally {
         setLoadingData(false);
       }
@@ -243,11 +329,24 @@ export default function App() {
     return () => clearInterval(interval);
   }, [quizState, timerActive, timeLeft]);
 
+  const questionContainerRef = useRef<HTMLDivElement>(null);
+
+  // Scroll to question on start or when question index changes, ensuring focus shifts to Q1 or current Q
+  useEffect(() => {
+    if (quizState === 'active' && questionContainerRef.current) {
+      questionContainerRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      questionContainerRef.current.focus({ preventScroll: true });
+    }
+  }, [quizState, currentIndex]);
+
   const handleGoogleLogin = async () => {
+    logEvent('INBOUND', 'GOOGLE_LOGIN_CLICK', 'User clicked Google Sign-In', 'INFO', 204);
     try {
       await signInWithPopup(auth, googleProvider);
+      logEvent('SYSTEM', 'GOOGLE_LOGIN_SUCCESS', 'User successfully signed in with Google', 'SUCCESS', 200);
     } catch (err) {
       console.error('Login error:', err);
+      logEvent('ERROR', 'GOOGLE_LOGIN_ERROR', String(err), 'ERROR', 500);
     }
   };
 
@@ -273,28 +372,44 @@ export default function App() {
       timestamp: new Date()
     };
     setMistakes(prev => [sample, ...prev]);
+    logEvent('INBOUND', 'LOAD_SAMPLE_MISTAKE', 'User loaded sample mistake into mistake bank', 'SUCCESS', 201);
   };
 
   const handleLogout = async () => {
+    logEvent('INBOUND', 'LOGOUT_CLICK', 'User clicked sign out', 'INFO', 204);
     try {
       await signOut(auth);
       setActiveTab('home');
+      logEvent('SYSTEM', 'LOGOUT_SUCCESS', 'User signed out successfully', 'SUCCESS', 200);
     } catch (err) {
       console.error('Logout error:', err);
+      logEvent('ERROR', 'LOGOUT_ERROR', String(err), 'ERROR', 500);
     }
   };
 
-  // Start 20-Question Quiz (Client-side Gemini AI + Fallback Pool)
+  // Start Quiz with strict anti-repetition & fresh question generation
   const startQuiz = async () => {
+    logEvent('INBOUND', 'START_QUIZ_CLICK', 'User initiated Start Quiz', 'INFO', 204);
     setQuizState('loading');
+    const generationSeed = Date.now();
+    const recentIds = getRecentQuestionIds();
+
     try {
       const apiKey = userApiKey || import.meta.env.VITE_GEMINI_API_KEY || '';
       if (!apiKey) {
-        // Use diverse random questions pool
+        logEvent('SYSTEM', 'QUIZ_FALLBACK_POOL', 'No Gemini API key provided. Using fresh randomized pool with anti-repetition filter.', 'INFO', 204);
         const pool = getRandomDiverseQuestions();
-        const p1 = pool.filter(q => q.paper === 'Paper 1').sort(() => 0.5 - Math.random()).slice(0, 10);
-        const p2 = pool.filter(q => q.paper === 'Paper 2').sort(() => 0.5 - Math.random()).slice(0, 10);
+        // Filter out recently used questions
+        const unvisitedPool = pool.filter(q => !recentIds.includes(q.id));
+        const poolToUse = unvisitedPool.length >= 20 ? unvisitedPool : pool;
+
+        const p1 = poolToUse.filter(q => q.paper === 'Paper 1').sort(() => 0.5 - Math.random()).slice(0, 10);
+        const p2 = poolToUse.filter(q => q.paper === 'Paper 2').sort(() => 0.5 - Math.random()).slice(0, 10);
         const selected = [...p1, ...p2].sort(() => 0.5 - Math.random());
+
+        // Save selected to recent tracker
+        saveRecentQuestionIds([...recentIds, ...selected.map(q => q.id)]);
+
         setQuestions(selected);
         setCurrentIndex(0);
         setSelectedAnswers({});
@@ -302,16 +417,19 @@ export default function App() {
         setTimeLeft(30 * 60);
         setTimerActive(true);
         setQuizState('active');
+        logEvent('SYSTEM', 'QUIZ_STARTED_SUCCESS', `Quiz started with ${selected.length} fresh questions from randomized pool`, 'SUCCESS', 200);
         return;
       }
 
+      logEvent('OUTBOUND', 'GEMINI_API_REQUEST', `Calling Gemini API (gemini-2.5-flash) with seed ${generationSeed}`, 'INFO', 204);
       const ai = new GoogleGenAI({ apiKey });
       const prompt = `You are an expert Ph.D. Entrance Examination Committee member at Punyashlok Ahilyadevi Holkar Solapur University.
-Generate a brand new, highly rigorous 20-question PET-10 Entrance Exam quiz strictly adhering to the following structure:
+Generate a brand new, highly rigorous, completely unique 20-question PET-10 Entrance Exam quiz (Seed: ${generationSeed}). 
+CRITICAL: Generate 100% brand new questions that avoid repetition. Cover deep conceptual and numerical problems:
 - Exactly 10 questions for Paper 1: Research Methodology.
 - Exactly 10 questions for Paper 2: Mechanical Engineering.
 Return a valid JSON array of exactly 20 objects. Each object must have:
-- "id": string
+- "id": string (e.g. "gen_${Date.now()}_1")
 - "paper": "Paper 1" or "Paper 2"
 - "unit": string
 - "question": string
@@ -327,7 +445,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
       });
 
       const text = response.text;
-      if (!text) throw new Error('No response');
+      if (!text) throw new Error('Empty response from Gemini API');
       const data = JSON.parse(text);
       if (Array.isArray(data) && data.length > 0) {
         setQuestions(data);
@@ -337,16 +455,24 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
         setTimeLeft(30 * 60);
         setTimerActive(true);
         setQuizState('active');
+        logEvent('OUTBOUND', 'GEMINI_API_SUCCESS', `Successfully generated ${data.length} AI questions on the fly`, 'SUCCESS', 200);
       } else {
-        throw new Error('Invalid format');
+        throw new Error('Invalid JSON array format returned');
       }
     } catch (err) {
       console.error('Quiz generation error:', err);
-      // Fallback to diverse random questions pool
+      logEvent('ERROR', 'GEMINI_API_ERROR', String(err) + '. Falling back to randomized question pool.', 'ERROR', 500);
+      
       const pool = getRandomDiverseQuestions();
-      const p1 = pool.filter(q => q.paper === 'Paper 1').sort(() => 0.5 - Math.random()).slice(0, 10);
-      const p2 = pool.filter(q => q.paper === 'Paper 2').sort(() => 0.5 - Math.random()).slice(0, 10);
+      const unvisitedPool = pool.filter(q => !recentIds.includes(q.id));
+      const poolToUse = unvisitedPool.length >= 20 ? unvisitedPool : pool;
+
+      const p1 = poolToUse.filter(q => q.paper === 'Paper 1').sort(() => 0.5 - Math.random()).slice(0, 10);
+      const p2 = poolToUse.filter(q => q.paper === 'Paper 2').sort(() => 0.5 - Math.random()).slice(0, 10);
       const selected = [...p1, ...p2].sort(() => 0.5 - Math.random());
+
+      saveRecentQuestionIds([...recentIds, ...selected.map(q => q.id)]);
+
       setQuestions(selected);
       setCurrentIndex(0);
       setSelectedAnswers({});
@@ -354,19 +480,23 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
       setTimeLeft(30 * 60);
       setTimerActive(true);
       setQuizState('active');
+      logEvent('SYSTEM', 'QUIZ_FALLBACK_STARTED', `Quiz started with ${selected.length} questions from fallback pool`, 'SUCCESS', 200);
     }
   };
 
   const handleSelectOption = (qIdx: number, optIdx: number) => {
+    logEvent('INBOUND', 'SELECT_OPTION', `Selected option ${String.fromCharCode(65 + optIdx)} for Question ${qIdx + 1}`, 'INFO', 204);
     setSelectedAnswers(prev => ({ ...prev, [qIdx]: optIdx }));
   };
 
   const toggleMarkForReview = (qIdx: number) => {
+    logEvent('INBOUND', 'MARK_REVIEW', `Toggled bookmark for Question ${qIdx + 1}`, 'INFO', 204);
     setMarkedForReview(prev => ({ ...prev, [qIdx]: !prev[qIdx] }));
   };
 
   // Submit Quiz & Grade
   const submitQuiz = async () => {
+    logEvent('INBOUND', 'SUBMIT_QUIZ_CLICK', 'User submitted quiz', 'INFO', 204);
     setTimerActive(false);
     let score = 0;
     let paper1Score = 0;
@@ -410,6 +540,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
     // Save to Firestore & Mistake Bank if user is logged in
     if (user) {
       try {
+        logEvent('OUTBOUND', 'SAVE_ATTEMPT_FIRESTORE', `Saving quiz attempt score ${score}/${questions.length} (${percentage}%) to Firestore`, 'INFO', 204);
         const docRef = await addDoc(collection(db, 'quiz_attempts'), attemptData);
         setAttempts(prev => [{ id: docRef.id, ...attemptData, timestamp: new Date() }, ...prev]);
 
@@ -436,8 +567,10 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
             setMistakes(prev => [{ id: mRef.id, ...mistakeItem, timestamp: new Date() }, ...prev]);
           }
         }
+        logEvent('SYSTEM', 'SUBMIT_QUIZ_SAVED', 'Quiz attempt and mistakes saved to Firestore successfully', 'SUCCESS', 201);
       } catch (err) {
         handleFirestoreError(err, OperationType.CREATE, 'quiz_attempts / mistake_bank');
+        logEvent('ERROR', 'SAVE_ATTEMPT_ERROR', String(err), 'ERROR', 500);
       }
     }
 
@@ -490,6 +623,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
 
   // Handle Mistake Practice Answer
   const handleMistakeAnswer = async (selectedOpt: number) => {
+    logEvent('INBOUND', 'PRACTICE_MISTAKE_ANSWER', `Selected answer ${selectedOpt} for mistake re-practice`, 'INFO', 204);
     setMistakeAnswer(selectedOpt);
     const currentMistake = activeMistakes[mistakeIndex];
     const isCorrect = selectedOpt === currentMistake.correct_answer;
@@ -513,13 +647,21 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
           mastered: isMastered,
           practice_count: (m.practice_count || 0) + 1
         } : m));
+        logEvent('SYSTEM', 'MISTAKE_PRACTICE_UPDATE', `Mistake updated. Streak: ${newStreak}, Mastered: ${isMastered}`, 'SUCCESS', 201);
       } catch (err) {
         handleFirestoreError(err, OperationType.UPDATE, 'mistake_bank');
+        logEvent('ERROR', 'MISTAKE_UPDATE_ERROR', String(err), 'ERROR', 500);
       }
     }
   };
 
   const activeMistakes = mistakes.filter(m => !m.mastered);
+
+  // Filtered logs based on 'showInfoLogs'
+  const filteredLogs = useMemo(() => {
+    if (showInfoLogs) return logs;
+    return logs.filter(l => l.status !== 'INFO' && l.statusCode !== 204);
+  }, [logs, showInfoLogs]);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased selection:bg-emerald-500 selection:text-white">
@@ -604,7 +746,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
 
             <button
               onClick={() => { setTempKeyInput(userApiKey); setSettingsOpen(true); }}
-              title="Gemini API Key Settings"
+              title="Settings & System Logs"
               className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors relative"
             >
               <Settings className="w-4 h-4" />
@@ -692,7 +834,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
                     ) : (
                       <>
                         <Play className="w-5 h-5 fill-current" />
-                        <span>Start 20-Question PET-10 Quiz</span>
+                        <span>Start Quiz</span>
                       </>
                     )}
                   </button>
@@ -778,12 +920,12 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
         {activeTab === 'home' && quizState === 'loading' && (
           <div className="py-20 flex flex-col items-center justify-center space-y-4">
             <div className="w-12 h-12 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin"></div>
-            <p className="text-slate-300 font-medium">Generating AI PET-10 Exam based on PAHSU syllabus & PYQs...</p>
+            <p className="text-slate-300 font-medium">Generating fresh AI PET-10 Exam (avoiding repeating questions)...</p>
           </div>
         )}
 
         {quizState === 'active' && questions.length > 0 && (
-          <div className="space-y-6 max-w-4xl mx-auto">
+          <div ref={questionContainerRef} tabIndex={-1} className="space-y-6 max-w-4xl mx-auto outline-none">
             {/* Top Bar with Timer & Progress */}
             <div className="bg-slate-900 border border-slate-800 p-4 rounded-2xl flex flex-wrap items-center justify-between gap-4">
               <div className="flex items-center space-x-3">
@@ -848,7 +990,10 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
               {/* Navigation Controls */}
               <div className="flex items-center justify-between pt-4 border-t border-slate-800">
                 <button
-                  onClick={() => setCurrentIndex(prev => Math.max(0, prev - 1))}
+                  onClick={() => {
+                    logEvent('INBOUND', 'PREV_QUESTION', `Navigated to question index ${currentIndex - 1}`, 'INFO', 204);
+                    setCurrentIndex(prev => Math.max(0, prev - 1));
+                  }}
                   disabled={currentIndex === 0}
                   className="flex items-center space-x-2 px-4 py-2 rounded-xl bg-slate-800 text-slate-300 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed font-medium text-sm"
                 >
@@ -860,7 +1005,10 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
                 </span>
                 {currentIndex < questions.length - 1 ? (
                   <button
-                    onClick={() => setCurrentIndex(prev => Math.min(questions.length - 1, prev + 1))}
+                    onClick={() => {
+                      logEvent('INBOUND', 'NEXT_QUESTION', `Navigated to next question index ${currentIndex + 1}`, 'INFO', 204);
+                      setCurrentIndex(prev => Math.min(questions.length - 1, prev + 1));
+                    }}
                     className="flex items-center space-x-2 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm"
                   >
                     <span>Next</span>
@@ -894,7 +1042,10 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
                   return (
                     <button
                       key={idx}
-                      onClick={() => setCurrentIndex(idx)}
+                      onClick={() => {
+                        logEvent('INBOUND', 'PALETTE_JUMP', `Jumped to question index ${idx + 1}`, 'INFO', 204);
+                        setCurrentIndex(idx);
+                      }}
                       className={`h-9 rounded-lg border font-mono text-xs font-bold transition-all flex items-center justify-center ${bgClass}`}
                     >
                       {idx + 1}
@@ -1018,7 +1169,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
                 className="flex items-center space-x-2 px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm shadow-lg shadow-emerald-900/30"
               >
                 <Play className="w-4 h-4" />
-                <span>Take Practice Quiz</span>
+                <span>Start Quiz</span>
               </button>
             </div>
 
@@ -1382,18 +1533,18 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
 
       </main>
 
-      {/* Settings Modal for Gemini API Key */}
+      {/* Settings Modal (Gemini API Key + System Logs Console with HTTP Status and Filter) */}
       {settingsOpen && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-700 w-full max-w-md rounded-2xl p-6 sm:p-8 space-y-6 shadow-2xl relative animate-in fade-in zoom-in duration-200">
-            <div className="flex items-center justify-between">
+          <div className="bg-slate-900 border border-slate-700 w-full max-w-4xl rounded-2xl p-6 sm:p-8 space-y-6 shadow-2xl relative animate-in fade-in zoom-in duration-200 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-800">
               <div className="flex items-center space-x-3">
                 <div className="p-2.5 rounded-xl bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
                   <Settings className="w-5 h-5" />
                 </div>
                 <div>
-                  <h3 className="text-lg font-bold text-white">Gemini API Key Settings</h3>
-                  <p className="text-xs text-slate-400">Enable on-the-fly AI question generation</p>
+                  <h3 className="text-lg font-bold text-white">Settings & System Logs Console</h3>
+                  <p className="text-xs text-slate-400">Manage Gemini API Key and review live audit logs</p>
                 </div>
               </div>
               <button 
@@ -1404,56 +1555,152 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
               </button>
             </div>
 
-            <div className="space-y-4">
-              <p className="text-xs text-slate-300 leading-relaxed">
-                Enter your personal Gemini API key below to enable real-time, on-the-fly AI question generation. Your key is stored securely in your browser's local storage.
-              </p>
-
-              {/* Step-by-step guide to get API key */}
-              <div className="bg-slate-800/60 border border-slate-700/80 p-3.5 rounded-xl space-y-2 text-xs text-slate-300">
-                <p className="font-bold text-emerald-400 flex items-center justify-between">
-                  <span>How to get a free Gemini API Key:</span>
-                  <a 
-                    href="https://aistudio.google.com/app/apikey" 
-                    target="_blank" 
-                    rel="noreferrer"
-                    className="text-teal-400 underline hover:text-teal-300"
-                  >
-                    Get Key &rarr;
-                  </a>
+            <div className="space-y-6">
+              {/* Gemini API Key Section */}
+              <div className="bg-slate-800/50 border border-slate-700/60 p-5 rounded-xl space-y-4">
+                <h4 className="text-sm font-bold text-white flex items-center space-x-2">
+                  <Sparkles className="w-4 h-4 text-emerald-400" />
+                  <span>Gemini API Key Configuration</span>
+                </h4>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Enter your personal Gemini API key below to enable real-time, on-the-fly AI question generation. Your key is stored securely in your browser's local storage.
                 </p>
-                <ol className="list-decimal list-inside space-y-1 text-slate-300 text-[11px]">
-                  <li>Go to <span className="text-white">Google AI Studio</span> (link above).</li>
-                  <li>Sign in with your Google account.</li>
-                  <li>Click <strong className="text-white">"Create API key"</strong>.</li>
-                  <li>Copy and paste your key into the field below.</li>
-                </ol>
+
+                <div className="bg-slate-900/60 border border-slate-700 p-3 rounded-lg space-y-2 text-xs text-slate-300">
+                  <p className="font-bold text-emerald-400 flex items-center justify-between">
+                    <span>How to get a free Gemini API Key:</span>
+                    <a 
+                      href="https://aistudio.google.com/app/apikey" 
+                      target="_blank" 
+                      rel="noreferrer"
+                      className="text-teal-400 underline hover:text-teal-300"
+                    >
+                      Get Key &rarr;
+                    </a>
+                  </p>
+                  <ol className="list-decimal list-inside space-y-1 text-slate-300 text-[11px]">
+                    <li>Go to <span className="text-white">Google AI Studio</span>.</li>
+                    <li>Sign in with your Google account and click <strong className="text-white">"Create API key"</strong>.</li>
+                    <li>Paste your key below.</li>
+                  </ol>
+                </div>
+
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <input
+                    type="password"
+                    value={tempKeyInput}
+                    onChange={(e) => setTempKeyInput(e.target.value)}
+                    placeholder="AIzaSy..."
+                    className="flex-1 px-4 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-white text-sm focus:outline-none focus:border-emerald-500 font-mono"
+                  />
+                  <button
+                    onClick={saveApiKey}
+                    className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-lg shadow-emerald-900/30 whitespace-nowrap"
+                  >
+                    Save API Key
+                  </button>
+                </div>
               </div>
 
-              <div className="space-y-2">
-                <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">Gemini API Key</label>
-                <input
-                  type="password"
-                  value={tempKeyInput}
-                  onChange={(e) => setTempKeyInput(e.target.value)}
-                  placeholder="AIzaSy..."
-                  className="w-full px-4 py-3 rounded-xl bg-slate-800 border border-slate-700 text-white text-sm focus:outline-none focus:border-emerald-500 font-mono"
-                />
+              {/* System Logs Console Section */}
+              <div className="space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pb-2 border-b border-slate-800">
+                  <div className="flex items-center space-x-2">
+                    <Terminal className="w-5 h-5 text-emerald-400" />
+                    <h4 className="text-sm font-bold text-white">System Logs & Audit Trail</h4>
+                    <span className="px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 text-xs font-mono">
+                      {filteredLogs.length} items
+                    </span>
+                  </div>
+
+                  <div className="flex items-center space-x-3">
+                    {/* Filter Option for Info Logs */}
+                    <label className="flex items-center space-x-2 text-xs text-slate-300 cursor-pointer select-none bg-slate-800/80 px-3 py-1.5 rounded-lg border border-slate-700">
+                      <input 
+                        type="checkbox" 
+                        checked={showInfoLogs}
+                        onChange={(e) => setShowInfoLogs(e.target.checked)}
+                        className="rounded border-slate-700 text-emerald-600 focus:ring-emerald-500 h-3.5 w-3.5 bg-slate-900"
+                      />
+                      <span>Show Info Logs</span>
+                    </label>
+
+                    <button
+                      onClick={() => {
+                        setLogs([]);
+                        logEvent('SYSTEM', 'CLEAR_LOGS_CONSOLE', 'User cleared logs console', 'INFO', 204);
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold border border-slate-700"
+                    >
+                      Clear Logs
+                    </button>
+                  </div>
+                </div>
+
+                <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden max-h-72 overflow-y-auto">
+                  {filteredLogs.length === 0 ? (
+                    <div className="p-8 text-center text-slate-500 text-xs">
+                      No logs to display with current filters.
+                    </div>
+                  ) : (
+                    <table className="w-full text-left text-xs font-mono">
+                      <thead>
+                        <tr className="bg-slate-900 border-b border-slate-800 text-slate-400 uppercase text-[10px]">
+                          <th className="p-3">Time</th>
+                          <th className="p-3">HTTP Status</th>
+                          <th className="p-3">Type</th>
+                          <th className="p-3">Action</th>
+                          <th className="p-3">Status</th>
+                          <th className="p-3">Details</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/60 text-slate-300 text-[11px]">
+                        {filteredLogs.map((log, idx) => {
+                          const timeStr = log.timestamp?.toDate ? log.timestamp.toDate().toLocaleTimeString() : (log.timestamp instanceof Date ? log.timestamp.toLocaleTimeString() : 'Just now');
+                          
+                          let statusBg = 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+                          if (log.statusCode >= 400) statusBg = 'bg-rose-500/20 text-rose-400 border border-rose-500/30';
+                          else if (log.statusCode === 201) statusBg = 'bg-blue-500/20 text-blue-400 border border-blue-500/30';
+                          else if (log.statusCode === 204) statusBg = 'bg-slate-800 text-slate-400 border border-slate-700';
+
+                          let typeBg = 'bg-slate-800 text-slate-300';
+                          if (log.type === 'INBOUND') typeBg = 'bg-blue-500/20 text-blue-400';
+                          if (log.type === 'OUTBOUND') typeBg = 'bg-purple-500/20 text-purple-400';
+                          if (log.type === 'SYSTEM') typeBg = 'bg-teal-500/20 text-teal-400';
+                          if (log.type === 'ERROR') typeBg = 'bg-rose-500/20 text-rose-400';
+
+                          return (
+                            <tr key={idx} className="hover:bg-slate-900/60">
+                              <td className="p-3 text-slate-400 whitespace-nowrap">{timeStr}</td>
+                              <td className="p-3 whitespace-nowrap">
+                                <span className={`px-2 py-0.5 rounded font-bold text-[10px] ${statusBg}`}>
+                                  {log.statusCode || 200}
+                                </span>
+                              </td>
+                              <td className="p-3 whitespace-nowrap">
+                                <span className={`px-2 py-0.5 rounded font-bold text-[10px] ${typeBg}`}>
+                                  {log.type}
+                                </span>
+                              </td>
+                              <td className="p-3 font-bold text-white whitespace-nowrap">{log.action}</td>
+                              <td className="p-3 whitespace-nowrap font-bold text-emerald-400">{log.status}</td>
+                              <td className="p-3 text-slate-300 truncate max-w-xs" title={log.details}>{log.details}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
               </div>
             </div>
 
-            <div className="flex justify-end space-x-3 pt-2 border-t border-slate-800">
+            <div className="flex justify-end pt-2 border-t border-slate-800">
               <button
                 onClick={() => setSettingsOpen(false)}
-                className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium text-xs"
+                className="px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs"
               >
-                Cancel
-              </button>
-              <button
-                onClick={saveApiKey}
-                className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-lg shadow-emerald-900/30"
-              >
-                Save & Use AI Generation
+                Close Settings
               </button>
             </div>
           </div>
@@ -1594,6 +1841,43 @@ function getRandomDiverseQuestions(): Question[] {
       ],
       correct_index: 1,
       explanation: 'Academia-industry collaboration bridges theoretical developments with practical applications, fostering patents and societal impact.'
+    },
+    {
+      id: 'p1_11',
+      paper: 'Paper 1',
+      unit: 'Unit 6: Data Collection, Processing and Analysis',
+      question: 'Which statistical test is appropriate for comparing the means of three or more independent groups simultaneously?',
+      options: ['Student t-test', 'Chi-Square test', 'ANOVA (Analysis of Variance)', 'Mann-Whitney U test'],
+      correct_index: 2,
+      explanation: 'ANOVA is used to test for significant differences between the means of three or more independent samples.'
+    },
+    {
+      id: 'p1_12',
+      paper: 'Paper 1',
+      unit: 'Unit 7: Hypothesis',
+      question: 'What does a p-value less than 0.05 signify in statistical hypothesis testing?',
+      options: [
+        'Acceptance of the null hypothesis with 95% certainty',
+        'Rejection of the null hypothesis in favor of the alternative hypothesis',
+        'Probability that the sample size was too small',
+        'Absence of any sampling error'
+      ],
+      correct_index: 1,
+      explanation: 'A p-value < 0.05 indicates strong evidence against the null hypothesis, leading to its rejection at the 5% significance level.'
+    },
+    {
+      id: 'p1_13',
+      paper: 'Paper 1',
+      unit: 'Unit 8: Research Ethics, Plagiarism and Impact',
+      question: 'What is the primary function of double-blind peer review in scholarly publishing?',
+      options: [
+        'To speed up publication time without editorial checks',
+        'To ensure unbiased evaluation by hiding identities of both authors and reviewers',
+        'To allow authors to select their own reviewers',
+        'To restrict readership to subscribers only'
+      ],
+      correct_index: 1,
+      explanation: 'Double-blind peer review maintains impartiality by concealing the identities of authors from reviewers and vice versa.'
     }
   ];
 
@@ -1722,6 +2006,48 @@ function getRandomDiverseQuestions(): Question[] {
       ],
       correct_index: 1,
       explanation: 'In the fully rough turbulent zone (Moody diagram), the friction factor is independent of Reynolds number and depends solely on relative roughness (epsilon / D).'
+    },
+    {
+      id: 'p2_11',
+      paper: 'Paper 2',
+      unit: 'Unit 3: Materials, Manufacturing and Industrial Engineering',
+      question: 'In orthogonal cutting, the rake angle is defined as:',
+      options: [
+        'The angle between tool face and the normal to the workpiece surface',
+        'The angle between the shear plane and cutting velocity vector',
+        'The clearance angle of the tool flank',
+        'The angle of inclination of cutting edge'
+      ],
+      correct_index: 0,
+      explanation: 'The rake angle is the angle between the tool face and a line perpendicular to the work surface, influencing chip formation and cutting forces.'
+    },
+    {
+      id: 'p2_12',
+      paper: 'Paper 2',
+      unit: 'Unit 1: Applied Mechanics and Design',
+      question: 'What is the natural frequency of transverse vibration of a simply supported beam of mass m and span L with a central concentrated load W?',
+      options: [
+        'Proportional to L^2',
+        'Inversely proportional to L^3/2',
+        'Proportional to sqrt(g / static deflection delta)',
+        'Independent of beam material density'
+      ],
+      correct_index: 2,
+      explanation: 'The natural frequency of a lumped mass vibrating system is given by fn = (1/(2*pi)) * sqrt(g / delta), where delta is the static deflection under gravity.'
+    },
+    {
+      id: 'p2_13',
+      paper: 'Paper 2',
+      unit: 'Unit 2: Fluid Mechanics and Thermal Sciences',
+      question: 'For an irreversible adiabatic process in a closed system, entropy change ds is:',
+      options: [
+        'Equal to zero',
+        'Always greater than zero',
+        'Less than zero',
+        'Equal to heat transferred divided by temperature'
+      ],
+      correct_index: 1,
+      explanation: 'According to the Clausius inequality and Second Law of Thermodynamics, entropy increases during any irreversible adiabatic process (ds > 0).'
     }
   ];
 

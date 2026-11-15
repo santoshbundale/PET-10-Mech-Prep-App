@@ -29,5 +29,10 @@ service cloud.firestore {
     match /question_history/{historyId} {
       allow read, write, create, list: if request.auth != null;
     }
+
+    // App Logs for debugging inbound/outbound calls
+    match /app_logs/{logId} {
+      allow read, create, list: if request.auth != null;
+    }
   }
 }
