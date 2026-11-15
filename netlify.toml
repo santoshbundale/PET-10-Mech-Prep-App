@@ -1,0 +1,4 @@
+[build.environment]
+  # Firebase web configuration is intentionally included in the browser bundle.
+  # Keep scanning enabled for all other secrets.
+  SECRETS_SCAN_OMIT_KEYS = "VITE_FIREBASE_API_KEY,VITE_FIREBASE_AUTH_DOMAIN,VITE_FIREBASE_PROJECT_ID,VITE_FIREBASE_STORAGE_BUCKET,VITE_FIREBASE_MESSAGING_SENDER_ID,VITE_FIREBASE_APP_ID"
