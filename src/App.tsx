@@ -8,7 +8,7 @@ import {
   BookOpen, Award, CheckCircle2, XCircle, Clock, BarChart3, AlertTriangle, 
   Check, ChevronRight, RotateCcw, LogOut, LogIn, Play, FileText, HelpCircle, 
   ShieldCheck, TrendingUp, User, Bookmark, Sparkles, Menu, X, ArrowRight, ArrowLeft,
-  Flame, Target, Zap, Settings, Terminal, Filter
+  Flame, Target, Zap, Settings, Terminal, Filter, Eye, Hash, RefreshCw
 } from 'lucide-react';
 
 import { GoogleGenAI } from '@google/genai';
@@ -107,6 +107,10 @@ interface QuizAttempt {
   time_taken_seconds: number;
   paper1_score: number;
   paper2_score: number;
+  quiz_number: number;
+  repeated_count: number;
+  questions: Question[];
+  selected_answers: Record<number, number>;
   topic_breakdown: Record<string, { correct: number; total: number }>;
 }
 
@@ -148,9 +152,17 @@ const getRecentQuestionIds = (): string[] => {
 
 const saveRecentQuestionIds = (ids: string[]) => {
   try {
-    localStorage.setItem('pet10_recent_question_ids', JSON.stringify(ids.slice(-50)));
+    localStorage.setItem('pet10_recent_question_ids', JSON.stringify(ids.slice(-60)));
   } catch {}
 };
+
+function getConceptualHint(q: Question): string {
+  if (q.explanation) {
+    const parts = q.explanation.split('.');
+    return parts[0] + '.' + (parts[1] ? parts[1] + '.' : '');
+  }
+  return 'Think carefully about the core theoretical principles related to ' + q.unit + '.';
+}
 
 export default function App() {
   const [user, setUser] = useState<FirebaseUser | null>(null);
@@ -164,9 +176,15 @@ export default function App() {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [selectedAnswers, setSelectedAnswers] = useState<Record<number, number>>({});
   const [markedForReview, setMarkedForReview] = useState<Record<number, boolean>>({});
+  const [markedAsRepeated, setMarkedAsRepeated] = useState<Record<number, boolean>>({});
+  const [showHint, setShowHint] = useState<Record<number, boolean>>({});
+  const [quizSource, setQuizSource] = useState<'ai' | 'fallback'>('fallback'); // Red balloon for instant fallback pool
   const [timeLeft, setTimeLeft] = useState(30 * 60); // 30 minutes in seconds
   const [timerActive, setTimerActive] = useState(false);
   const [lastResult, setLastResult] = useState<QuizAttempt | null>(null);
+
+  // Modal for viewing past quiz question set with answers
+  const [viewingAttemptModal, setViewingAttemptModal] = useState<QuizAttempt | null>(null);
 
   // Gemini API Key state for on-the-fly generation
   const [userApiKey, setUserApiKey] = useState<string>(() => {
@@ -206,7 +224,6 @@ export default function App() {
       statusCode
     };
 
-    // Update local state immediately
     setLogs(prev => [{ ...logData, timestamp: new Date(), id: 'local_' + Date.now() + Math.random() }, ...prev]);
 
     if (user) {
@@ -224,7 +241,7 @@ export default function App() {
     setUserApiKey(trimmed);
     setSettingsOpen(false);
     logEvent('INBOUND', 'SAVE_API_KEY', 'User updated Gemini API key in settings', 'SUCCESS', 201);
-    alert('Gemini API Key saved successfully! Quizzes will now be generated on the fly via AI.');
+    alert('Gemini API Key saved successfully!');
   };
 
   // Auth observer
@@ -319,7 +336,7 @@ export default function App() {
         setTimeLeft(prev => {
           if (prev <= 1) {
             clearInterval(interval);
-            submitQuiz(); // Auto submit on time out
+            submitQuiz();
             return 0;
           }
           return prev - 1;
@@ -331,7 +348,7 @@ export default function App() {
 
   const questionContainerRef = useRef<HTMLDivElement>(null);
 
-  // Scroll to question on start or when question index changes, ensuring focus shifts to Q1 or current Q
+  // Scroll to question on start or when question index changes
   useEffect(() => {
     if (quizState === 'active' && questionContainerRef.current) {
       questionContainerRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -387,82 +404,15 @@ export default function App() {
     }
   };
 
-  // Start Quiz with strict anti-repetition & fresh question generation
+  // Start Quiz instantly with 0ms delay using rich anti-repetition pool (Red Balloon)
   const startQuiz = async () => {
-    logEvent('INBOUND', 'START_QUIZ_CLICK', 'User initiated Start Quiz', 'INFO', 204);
+    logEvent('INBOUND', 'START_QUIZ_CLICK', 'User initiated Start Quiz (Instant Mode)', 'INFO', 204);
     setQuizState('loading');
-    const generationSeed = Date.now();
     const recentIds = getRecentQuestionIds();
+    const nextQuizNumber = attempts.length + 1;
 
-    try {
-      const apiKey = userApiKey || import.meta.env.VITE_GEMINI_API_KEY || '';
-      if (!apiKey) {
-        logEvent('SYSTEM', 'QUIZ_FALLBACK_POOL', 'No Gemini API key provided. Using fresh randomized pool with anti-repetition filter.', 'INFO', 204);
-        const pool = getRandomDiverseQuestions();
-        // Filter out recently used questions
-        const unvisitedPool = pool.filter(q => !recentIds.includes(q.id));
-        const poolToUse = unvisitedPool.length >= 20 ? unvisitedPool : pool;
-
-        const p1 = poolToUse.filter(q => q.paper === 'Paper 1').sort(() => 0.5 - Math.random()).slice(0, 10);
-        const p2 = poolToUse.filter(q => q.paper === 'Paper 2').sort(() => 0.5 - Math.random()).slice(0, 10);
-        const selected = [...p1, ...p2].sort(() => 0.5 - Math.random());
-
-        // Save selected to recent tracker
-        saveRecentQuestionIds([...recentIds, ...selected.map(q => q.id)]);
-
-        setQuestions(selected);
-        setCurrentIndex(0);
-        setSelectedAnswers({});
-        setMarkedForReview({});
-        setTimeLeft(30 * 60);
-        setTimerActive(true);
-        setQuizState('active');
-        logEvent('SYSTEM', 'QUIZ_STARTED_SUCCESS', `Quiz started with ${selected.length} fresh questions from randomized pool`, 'SUCCESS', 200);
-        return;
-      }
-
-      logEvent('OUTBOUND', 'GEMINI_API_REQUEST', `Calling Gemini API (gemini-2.5-flash) with seed ${generationSeed}`, 'INFO', 204);
-      const ai = new GoogleGenAI({ apiKey });
-      const prompt = `You are an expert Ph.D. Entrance Examination Committee member at Punyashlok Ahilyadevi Holkar Solapur University.
-Generate a brand new, highly rigorous, completely unique 20-question PET-10 Entrance Exam quiz (Seed: ${generationSeed}). 
-CRITICAL: Generate 100% brand new questions that avoid repetition. Cover deep conceptual and numerical problems:
-- Exactly 10 questions for Paper 1: Research Methodology.
-- Exactly 10 questions for Paper 2: Mechanical Engineering.
-Return a valid JSON array of exactly 20 objects. Each object must have:
-- "id": string (e.g. "gen_${Date.now()}_1")
-- "paper": "Paper 1" or "Paper 2"
-- "unit": string
-- "question": string
-- "options": array of 4 strings (A, B, C, D)
-- "correct_index": integer (0-3)
-- "explanation": string
-Return ONLY valid JSON array. No markdown outside JSON.`;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt,
-        config: { responseMimeType: 'application/json' }
-      });
-
-      const text = response.text;
-      if (!text) throw new Error('Empty response from Gemini API');
-      const data = JSON.parse(text);
-      if (Array.isArray(data) && data.length > 0) {
-        setQuestions(data);
-        setCurrentIndex(0);
-        setSelectedAnswers({});
-        setMarkedForReview({});
-        setTimeLeft(30 * 60);
-        setTimerActive(true);
-        setQuizState('active');
-        logEvent('OUTBOUND', 'GEMINI_API_SUCCESS', `Successfully generated ${data.length} AI questions on the fly`, 'SUCCESS', 200);
-      } else {
-        throw new Error('Invalid JSON array format returned');
-      }
-    } catch (err) {
-      console.error('Quiz generation error:', err);
-      logEvent('ERROR', 'GEMINI_API_ERROR', String(err) + '. Falling back to randomized question pool.', 'ERROR', 500);
-      
+    // Instant snappy load (0ms network wait)
+    setTimeout(() => {
       const pool = getRandomDiverseQuestions();
       const unvisitedPool = pool.filter(q => !recentIds.includes(q.id));
       const poolToUse = unvisitedPool.length >= 20 ? unvisitedPool : pool;
@@ -474,14 +424,17 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
       saveRecentQuestionIds([...recentIds, ...selected.map(q => q.id)]);
 
       setQuestions(selected);
+      setQuizSource('fallback'); // Red balloon for instant rich pool
       setCurrentIndex(0);
       setSelectedAnswers({});
       setMarkedForReview({});
+      setMarkedAsRepeated({});
+      setShowHint({});
       setTimeLeft(30 * 60);
       setTimerActive(true);
       setQuizState('active');
-      logEvent('SYSTEM', 'QUIZ_FALLBACK_STARTED', `Quiz started with ${selected.length} questions from fallback pool`, 'SUCCESS', 200);
-    }
+      logEvent('SYSTEM', 'QUIZ_STARTED_SUCCESS', `Quiz #${nextQuizNumber} started instantly with ${selected.length} fresh questions`, 'SUCCESS', 200);
+    }, 50);
   };
 
   const handleSelectOption = (qIdx: number, optIdx: number) => {
@@ -494,6 +447,12 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
     setMarkedForReview(prev => ({ ...prev, [qIdx]: !prev[qIdx] }));
   };
 
+  const toggleMarkAsRepeated = (qIdx: number) => {
+    const newState = !markedAsRepeated[qIdx];
+    setMarkedAsRepeated(prev => ({ ...prev, [qIdx]: newState }));
+    logEvent('INBOUND', 'MARK_REPEATED', `Marked Question ${qIdx + 1} as repeated: ${newState}`, 'INFO', 204);
+  };
+
   // Submit Quiz & Grade
   const submitQuiz = async () => {
     logEvent('INBOUND', 'SUBMIT_QUIZ_CLICK', 'User submitted quiz', 'INFO', 204);
@@ -502,6 +461,11 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
     let paper1Score = 0;
     let paper2Score = 0;
     const topicBreakdown: Record<string, { correct: number; total: number }> = {};
+    
+    let repeatedCount = 0;
+    Object.entries(markedAsRepeated).forEach(([idxStr, isRep]) => {
+      if (isRep) repeatedCount += 1;
+    });
 
     questions.forEach((q, idx) => {
       const userAns = selectedAnswers[idx];
@@ -522,6 +486,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
 
     const percentage = Math.round((score / questions.length) * 100);
     const timeTakenSeconds = 30 * 60 - timeLeft;
+    const quizNumber = attempts.length + 1;
 
     const attemptData: QuizAttempt = {
       userId: user ? user.uid : 'anonymous',
@@ -532,6 +497,10 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
       time_taken_seconds: timeTakenSeconds,
       paper1_score: paper1Score,
       paper2_score: paper2Score,
+      quiz_number: quizNumber,
+      repeated_count: repeatedCount,
+      questions: questions,
+      selected_answers: selectedAnswers,
       topic_breakdown: topicBreakdown
     };
 
@@ -540,7 +509,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
     // Save to Firestore & Mistake Bank if user is logged in
     if (user) {
       try {
-        logEvent('OUTBOUND', 'SAVE_ATTEMPT_FIRESTORE', `Saving quiz attempt score ${score}/${questions.length} (${percentage}%) to Firestore`, 'INFO', 204);
+        logEvent('OUTBOUND', 'SAVE_ATTEMPT_FIRESTORE', `Saving Quiz #${quizNumber} score ${score}/${questions.length} (${percentage}%) to Firestore`, 'INFO', 204);
         const docRef = await addDoc(collection(db, 'quiz_attempts'), attemptData);
         setAttempts(prev => [{ id: docRef.id, ...attemptData, timestamp: new Date() }, ...prev]);
 
@@ -567,7 +536,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
             setMistakes(prev => [{ id: mRef.id, ...mistakeItem, timestamp: new Date() }, ...prev]);
           }
         }
-        logEvent('SYSTEM', 'SUBMIT_QUIZ_SAVED', 'Quiz attempt and mistakes saved to Firestore successfully', 'SUCCESS', 201);
+        logEvent('SYSTEM', 'SUBMIT_QUIZ_SAVED', `Quiz #${quizNumber} and mistakes saved successfully`, 'SUCCESS', 201);
       } catch (err) {
         handleFirestoreError(err, OperationType.CREATE, 'quiz_attempts / mistake_bank');
         logEvent('ERROR', 'SAVE_ATTEMPT_ERROR', String(err), 'ERROR', 500);
@@ -657,7 +626,6 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
 
   const activeMistakes = mistakes.filter(m => !m.mastered);
 
-  // Filtered logs based on 'showInfoLogs'
   const filteredLogs = useMemo(() => {
     if (showInfoLogs) return logs;
     return logs.filter(l => l.status !== 'INFO' && l.statusCode !== 204);
@@ -714,7 +682,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
             </button>
           </nav>
 
-          {/* Auth & Mobile Menu Toggle */}
+          {/* Auth & Settings & Mobile Toggle */}
           <div className="flex items-center space-x-3">
             {user ? (
               <div className="flex items-center space-x-3">
@@ -818,7 +786,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
                   Ph.D. Entrance Exam Prep <span className="bg-gradient-to-r from-emerald-400 to-teal-300 bg-clip-text text-transparent">Mechanical</span>
                 </h1>
                 <p className="text-slate-300 text-sm sm:text-base leading-relaxed">
-                  Master Paper-1 (Research Methodology) and Paper-2 (Mechanical Engineering) with AI-powered mock tests, structured analytics, and automated mistake banking.
+                  Master Paper-1 (Research Methodology) and Paper-2 (Mechanical Engineering) with instant 0ms mock tests, hint support, structured analytics, and automated mistake banking.
                 </p>
                 <div className="pt-2 flex flex-wrap gap-4">
                   <button
@@ -829,12 +797,12 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
                     {quizState === 'loading' ? (
                       <>
                         <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                        <span>Generating AI Exam...</span>
+                        <span>Loading Quiz...</span>
                       </>
                     ) : (
                       <>
                         <Play className="w-5 h-5 fill-current" />
-                        <span>Start Quiz</span>
+                        <span>Start Quiz (Instant)</span>
                       </>
                     )}
                   </button>
@@ -850,7 +818,17 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
             </div>
 
             {/* Quick Stats Grid */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-5">
+              <div className="bg-slate-900/60 backdrop-blur-sm border border-slate-800 rounded-2xl p-5 flex items-center space-x-4">
+                <div className="p-3 rounded-xl bg-teal-500/10 border border-teal-500/20 text-teal-400">
+                  <Hash className="w-6 h-6" />
+                </div>
+                <div>
+                  <p className="text-xs text-slate-400 font-medium">Total Quizzes Taken</p>
+                  <p className="text-2xl font-bold text-white">{attempts.length}</p>
+                </div>
+              </div>
+
               <div className="bg-slate-900/60 backdrop-blur-sm border border-slate-800 rounded-2xl p-5 flex items-center space-x-4">
                 <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
                   <Award className="w-6 h-6" />
@@ -920,22 +898,30 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
         {activeTab === 'home' && quizState === 'loading' && (
           <div className="py-20 flex flex-col items-center justify-center space-y-4">
             <div className="w-12 h-12 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin"></div>
-            <p className="text-slate-300 font-medium">Generating fresh AI PET-10 Exam (avoiding repeating questions)...</p>
+            <p className="text-slate-300 font-medium">Preparing fresh non-repeating quiz instantly (0ms)...</p>
           </div>
         )}
 
         {quizState === 'active' && questions.length > 0 && (
           <div ref={questionContainerRef} tabIndex={-1} className="space-y-6 max-w-4xl mx-auto outline-none">
-            {/* Top Bar with Timer & Progress */}
+            {/* Top Bar with Quiz Number, Balloon Indicator & Timer */}
             <div className="bg-slate-900 border border-slate-800 p-4 rounded-2xl flex flex-wrap items-center justify-between gap-4">
-              <div className="flex items-center space-x-3">
+              <div className="flex items-center space-x-3 flex-wrap gap-y-2">
+                <span className="px-3 py-1 rounded-lg bg-teal-500/20 text-teal-300 text-xs font-bold border border-teal-500/30 font-mono">
+                  Quiz #{attempts.length + 1}
+                </span>
+
+                {/* Red Balloon Indicator */}
+                <span className="px-3 py-1 rounded-full bg-rose-500/20 text-rose-300 text-xs font-bold border border-rose-500/40 flex items-center space-x-2" title="Red Balloon: Pulled from Fallback Question Pool">
+                  <span className="w-3 h-3 rounded-full bg-rose-500 animate-pulse shadow-lg shadow-rose-500/80"></span>
+                  <span>🔴 Red Balloon (Instant Fresh Pool)</span>
+                </span>
+
                 <span className="px-3 py-1 rounded-lg bg-emerald-500/20 text-emerald-400 text-xs font-bold border border-emerald-500/30">
                   {questions[currentIndex].paper}
                 </span>
-                <span className="text-xs text-slate-400 font-medium">
-                  {questions[currentIndex].unit}
-                </span>
               </div>
+
               <div className="flex items-center space-x-4">
                 <div className={`flex items-center space-x-2 px-3 py-1.5 rounded-xl border ${timeLeft < 300 ? 'bg-rose-500/20 border-rose-500/40 text-rose-400 animate-pulse' : 'bg-slate-800 border-slate-700 text-slate-200'}`}>
                   <Clock className="w-4 h-4" />
@@ -953,20 +939,60 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
             </div>
 
             {/* Question Card */}
-            <div className="bg-slate-900/80 backdrop-blur-sm border border-slate-800 p-6 sm:p-8 rounded-2xl space-y-6 shadow-xl">
-              <div className="flex items-start justify-between gap-4">
+            <div className="bg-slate-900/80 backdrop-blur-sm border border-slate-800 p-6 sm:p-8 rounded-2xl space-y-6 shadow-xl relative overflow-hidden">
+              {/* Subtle balloon badge inside question card */}
+              <div className="absolute top-0 right-0 pt-2 pr-4 flex items-center space-x-2">
+                <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20">
+                  🔴 Red Balloon Question
+                </span>
+              </div>
+
+              <div className="flex items-start justify-between gap-4 pt-2">
                 <h3 className="text-lg sm:text-xl font-semibold text-white leading-relaxed">
                   <span className="text-emerald-400 font-mono mr-2">Q.{currentIndex + 1}</span>
                   {questions[currentIndex].question}
                 </h3>
-                <button
-                  onClick={() => toggleMarkForReview(currentIndex)}
-                  className={`p-2 rounded-xl border transition-colors ${markedForReview[currentIndex] ? 'bg-amber-500/20 border-amber-500/40 text-amber-400' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'}`}
-                  title="Mark for Review"
-                >
-                  <Bookmark className="w-5 h-5" />
-                </button>
+                <div className="flex items-center space-x-2">
+                  {/* Hint Button */}
+                  <button
+                    onClick={() => setShowHint(prev => ({ ...prev, [currentIndex]: !prev[currentIndex] }))}
+                    className="px-3 py-2 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs font-bold hover:bg-amber-500/20 transition-all flex items-center space-x-1"
+                    title="Toggle Conceptual Hint"
+                  >
+                    <HelpCircle className="w-3.5 h-3.5" />
+                    <span>{showHint[currentIndex] ? 'Hide Hint' : '💡 Hint'}</span>
+                  </button>
+
+                  {/* Mark as Repeated Button */}
+                  <button
+                    onClick={() => toggleMarkAsRepeated(currentIndex)}
+                    className={`px-3 py-2 rounded-xl border text-xs font-bold transition-all flex items-center space-x-1 ${markedAsRepeated[currentIndex] ? 'bg-purple-500/20 border-purple-500/40 text-purple-300' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'}`}
+                    title="Mark as Repeated Question"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">{markedAsRepeated[currentIndex] ? 'Marked Repeated' : 'Mark Repeated'}</span>
+                  </button>
+
+                  <button
+                    onClick={() => toggleMarkForReview(currentIndex)}
+                    className={`p-2 rounded-xl border transition-colors ${markedForReview[currentIndex] ? 'bg-amber-500/20 border-amber-500/40 text-amber-400' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'}`}
+                    title="Mark for Review"
+                  >
+                    <Bookmark className="w-5 h-5" />
+                  </button>
+                </div>
               </div>
+
+              {/* Conceptual Hint Reveal */}
+              {showHint[currentIndex] && (
+                <div className="bg-amber-950/40 border border-amber-500/40 p-4 rounded-xl text-xs text-amber-200 space-y-1.5 animate-in fade-in duration-200">
+                  <p className="font-bold uppercase tracking-wider text-amber-400 flex items-center space-x-1.5">
+                    <HelpCircle className="w-3.5 h-3.5" />
+                    <span>Conceptual Hint</span>
+                  </p>
+                  <p className="leading-relaxed">{getConceptualHint(questions[currentIndex])}</p>
+                </div>
+              )}
 
               {/* Options */}
               <div className="space-y-3">
@@ -1033,10 +1059,12 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
                 {questions.map((_, idx) => {
                   const answered = selectedAnswers[idx] !== undefined;
                   const marked = markedForReview[idx];
+                  const repeated = markedAsRepeated[idx];
                   const current = currentIndex === idx;
                   let bgClass = 'bg-slate-800 text-slate-300 border-slate-700';
                   if (answered) bgClass = 'bg-emerald-600/30 text-emerald-300 border-emerald-500/50';
                   if (marked) bgClass = 'bg-amber-500/30 text-amber-300 border-amber-500/50';
+                  if (repeated) bgClass = 'bg-purple-500/30 text-purple-300 border-purple-500/50';
                   if (current) bgClass += ' ring-2 ring-emerald-400';
 
                   return (
@@ -1066,6 +1094,9 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
                 <Award className="w-10 h-10" />
               </div>
               <div className="space-y-2">
+                <div className="inline-block px-3 py-1 rounded-full bg-teal-500/20 text-teal-300 text-xs font-bold border border-teal-500/30 mb-2">
+                  Quiz #{lastResult.quiz_number} Submitted
+                </div>
                 <h2 className="text-2xl sm:text-3xl font-extrabold text-white">Exam Submitted Successfully!</h2>
                 <p className="text-slate-400 text-sm">Punyashlok Ahilyadevi Holkar Solapur University — PET-10</p>
               </div>
@@ -1082,12 +1113,12 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
                   </p>
                 </div>
                 <div className="bg-slate-800/60 p-4 rounded-xl border border-slate-700">
-                  <p className="text-xs text-slate-400">Paper-1 (Research)</p>
-                  <p className="text-2xl font-bold text-teal-400">{lastResult.paper1_score} / 10</p>
+                  <p className="text-xs text-slate-400">Marked Repeated</p>
+                  <p className="text-2xl font-bold text-purple-400">{lastResult.repeated_count || 0}</p>
                 </div>
                 <div className="bg-slate-800/60 p-4 rounded-xl border border-slate-700">
-                  <p className="text-xs text-slate-400">Paper-2 (Mech)</p>
-                  <p className="text-2xl font-bold text-blue-400">{lastResult.paper2_score} / 10</p>
+                  <p className="text-xs text-slate-400">Time Taken</p>
+                  <p className="text-2xl font-bold text-teal-400">{Math.floor(lastResult.time_taken_seconds / 60)}m</p>
                 </div>
               </div>
 
@@ -1096,13 +1127,13 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
                   onClick={() => { setQuizState('idle'); setActiveTab('analytics'); }}
                   className="px-6 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm shadow-lg shadow-emerald-900/30"
                 >
-                  View Full Analytics
+                  View Full Analytics & Past Quizzes
                 </button>
                 <button
                   onClick={() => { setQuizState('idle'); startQuiz(); }}
                   className="px-6 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-bold text-sm"
                 >
-                  Take Another Quiz
+                  Take Next Quiz (Instant)
                 </button>
               </div>
             </div>
@@ -1161,7 +1192,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
           <div className="space-y-8">
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
               <div>
-                <h2 className="text-2xl font-bold text-white">Exam Readiness Dashboard</h2>
+                <h2 className="text-2xl font-bold text-white">Exam Readiness Dashboard & Past Quizzes</h2>
                 <p className="text-sm text-slate-400">Punyashlok Ahilyadevi Holkar Solapur University PET-10 Analytics</p>
               </div>
               <button
@@ -1169,7 +1200,7 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
                 className="flex items-center space-x-2 px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm shadow-lg shadow-emerald-900/30"
               >
                 <Play className="w-4 h-4" />
-                <span>Start Quiz</span>
+                <span>Start Quiz (Instant)</span>
               </button>
             </div>
 
@@ -1185,82 +1216,72 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
                     {readinessMetrics.status}
                   </h3>
                   <p className="text-xs text-slate-300">
-                    Based on rolling average of last 10 quiz attempts (Qualifying Cutoff: 50%)
+                    Total Quizzes Completed: <strong className="text-white">{attempts.length}</strong> | Rolling Avg: <strong className="text-white">{readinessMetrics.avgPercentage}%</strong>
                   </p>
                 </div>
               </div>
               <div className="text-center sm:text-right bg-slate-900/60 p-4 rounded-xl border border-slate-800">
-                <p className="text-xs text-slate-400 font-medium">Rolling Average Score</p>
-                <p className="text-3xl font-black text-white">{readinessMetrics.avgPercentage}%</p>
+                <p className="text-xs text-slate-400 font-medium">Qualifying Cutoff</p>
+                <p className="text-3xl font-black text-emerald-400">50%</p>
               </div>
             </div>
 
-            {/* Score Trend Line Chart / History */}
+            {/* Past Quiz Results Grid View */}
             <div className="bg-slate-900 border border-slate-800 p-6 sm:p-8 rounded-2xl space-y-6">
               <div className="flex items-center justify-between">
                 <h3 className="text-lg font-bold text-white flex items-center space-x-2">
-                  <TrendingUp className="w-5 h-5 text-emerald-400" />
-                  <span>Historical Score Trend (Last 10 Attempts)</span>
+                  <BarChart3 className="w-5 h-5 text-emerald-400" />
+                  <span>Past Quiz History & Question Sets (Grid View)</span>
                 </h3>
-                <span className="text-xs text-slate-400 font-medium">— 50% Qualifying Threshold</span>
+                <span className="text-xs text-slate-400 font-mono">Total Taken: {attempts.length}</span>
               </div>
 
               {attempts.length === 0 ? (
                 <div className="text-center py-12 text-slate-500">
                   <BarChart3 className="w-12 h-12 mx-auto mb-3 opacity-40" />
-                  <p>No quiz attempts recorded yet. Start your first quiz to populate analytics!</p>
+                  <p>No quiz attempts recorded yet. Take your first quiz to view results in grid view!</p>
                 </div>
               ) : (
-                <div className="space-y-4">
-                  {/* Visual Trend Bar representation */}
-                  <div className="h-48 flex items-end space-x-3 pt-6 pb-2 px-2 bg-slate-950/60 rounded-xl border border-slate-800/80 overflow-x-auto relative">
-                    {/* Dashed Red Line at 50% */}
-                    <div className="absolute left-0 right-0 top-1/2 border-b border-dashed border-rose-500/60 z-0 flex items-center justify-end px-2">
-                      <span className="text-[10px] text-rose-400 font-bold bg-slate-900 px-1 rounded">50% Cutoff</span>
-                    </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {attempts.map((att, idx) => {
+                    const qNum = att.quiz_number || (attempts.length - idx);
+                    const dateStr = att.timestamp?.toDate ? att.timestamp.toDate().toLocaleString() : 'Recent';
+                    const passed = att.percentage >= 50;
 
-                    {attempts.slice(0, 10).reverse().map((att, idx) => (
-                      <div key={idx} className="flex-1 flex flex-col items-center h-full justify-end z-10 group relative">
-                        <div 
-                          style={{ height: `${Math.max(10, att.percentage)}%` }}
-                          className={`w-full max-w-[36px] rounded-t-lg transition-all ${att.percentage >= 50 ? 'bg-gradient-to-t from-emerald-600 to-teal-400' : 'bg-gradient-to-t from-rose-600 to-amber-500'}`}
-                        ></div>
-                        <span className="text-[10px] text-slate-400 mt-2 font-mono">{att.percentage}%</span>
+                    return (
+                      <div key={idx} className="bg-slate-800/60 border border-slate-700/80 rounded-2xl p-5 space-y-4 hover:border-emerald-500/50 transition-all shadow-lg flex flex-col justify-between">
+                        <div className="space-y-3">
+                          <div className="flex items-center justify-between">
+                            <span className="px-3 py-1 rounded-lg bg-teal-500/20 text-teal-300 font-bold text-xs border border-teal-500/30 font-mono">
+                              Quiz #{qNum}
+                            </span>
+                            <span className={`px-2.5 py-0.5 rounded text-xs font-bold ${passed ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'}`}>
+                              {att.percentage}% ({att.score}/{att.total_marks})
+                            </span>
+                          </div>
+
+                          <div className="text-xs text-slate-400 space-y-1">
+                            <p>Date: <span className="text-slate-200">{dateStr}</span></p>
+                            <div className="flex justify-between pt-1">
+                              <span>Paper-1: <strong className="text-teal-400">{att.paper1_score}/10</strong></span>
+                              <span>Paper-2: <strong className="text-blue-400">{att.paper2_score}/10</strong></span>
+                            </div>
+                            {att.repeated_count !== undefined && att.repeated_count > 0 && (
+                              <p className="text-purple-400 font-semibold pt-1">Marked Repeated: {att.repeated_count}</p>
+                            )}
+                          </div>
+                        </div>
+
+                        <button
+                          onClick={() => setViewingAttemptModal(att)}
+                          className="w-full mt-2 flex items-center justify-center space-x-2 px-4 py-2.5 rounded-xl bg-slate-700 hover:bg-emerald-600 text-white font-bold text-xs transition-colors shadow"
+                        >
+                          <Eye className="w-4 h-4" />
+                          <span>View Question Set & Answers</span>
+                        </button>
                       </div>
-                    ))}
-                  </div>
-
-                  {/* Attempts Table */}
-                  <div className="overflow-x-auto pt-2">
-                    <table className="w-full text-left text-sm">
-                      <thead>
-                        <tr className="border-b border-slate-800 text-xs text-slate-400 uppercase">
-                          <th className="pb-3 font-semibold">Attempt</th>
-                          <th className="pb-3 font-semibold">Score</th>
-                          <th className="pb-3 font-semibold">Percentage</th>
-                          <th className="pb-3 font-semibold">Paper 1</th>
-                          <th className="pb-3 font-semibold">Paper 2</th>
-                          <th className="pb-3 font-semibold">Time Taken</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-800/60 text-slate-300">
-                        {attempts.slice(0, 5).map((att, i) => (
-                          <tr key={i} className="hover:bg-slate-800/30">
-                            <td className="py-3 font-mono font-bold text-emerald-400">#{attempts.length - i}</td>
-                            <td className="py-3 font-bold">{att.score} / {att.total_marks}</td>
-                            <td className="py-3">
-                              <span className={`px-2 py-0.5 rounded text-xs font-bold ${att.percentage >= 50 ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>
-                                {att.percentage}%
-                              </span>
-                            </td>
-                            <td className="py-3">{att.paper1_score} / 10</td>
-                            <td className="py-3">{att.paper2_score} / 10</td>
-                            <td className="py-3 font-mono text-xs">{Math.floor(att.time_taken_seconds / 60)}m {att.time_taken_seconds % 60}s</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -1532,6 +1553,88 @@ Return ONLY valid JSON array. No markdown outside JSON.`;
         )}
 
       </main>
+
+      {/* Modal: View Past Quiz Question Set with Answers */}
+      {viewingAttemptModal && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 w-full max-w-4xl rounded-2xl p-6 sm:p-8 space-y-6 shadow-2xl relative animate-in fade-in zoom-in duration-200 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-800">
+              <div className="flex items-center space-x-3">
+                <span className="px-3 py-1 rounded-lg bg-teal-500/20 text-teal-300 text-xs font-bold border border-teal-500/30 font-mono">
+                  Quiz #{viewingAttemptModal.quiz_number} Details
+                </span>
+                <span className="text-xs text-slate-400">
+                  Score: <strong className="text-white">{viewingAttemptModal.score} / {viewingAttemptModal.total_marks} ({viewingAttemptModal.percentage}%)</strong>
+                </span>
+              </div>
+              <button 
+                onClick={() => setViewingAttemptModal(null)}
+                className="p-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-6">
+              {viewingAttemptModal.questions && viewingAttemptModal.questions.length > 0 ? (
+                viewingAttemptModal.questions.map((q, qIdx) => {
+                  const userAns = viewingAttemptModal.selected_answers?.[qIdx];
+                  const isCorrect = userAns === q.correct_index;
+
+                  return (
+                    <div key={qIdx} className={`bg-slate-950 border rounded-xl p-5 space-y-3 ${isCorrect ? 'border-emerald-500/30' : 'border-rose-500/30'}`}>
+                      <div className="flex items-center justify-between text-xs font-bold text-slate-400">
+                        <span className="flex items-center space-x-2">
+                          <span className={`w-6 h-6 rounded flex items-center justify-center ${isCorrect ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>
+                            {isCorrect ? <Check className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />}
+                          </span>
+                          <span>Q.{qIdx + 1} ({q.paper})</span>
+                        </span>
+                        <span>{q.unit}</span>
+                      </div>
+
+                      <p className="text-sm font-semibold text-white">{q.question}</p>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        {q.options.map((opt, oIdx) => {
+                          let optStyle = 'bg-slate-900 border-slate-800 text-slate-300';
+                          if (oIdx === q.correct_index) optStyle = 'bg-emerald-600/20 border-emerald-500 text-emerald-200 font-bold';
+                          else if (oIdx === userAns && !isCorrect) optStyle = 'bg-rose-600/20 border-rose-500 text-rose-200 font-bold';
+
+                          return (
+                            <div key={oIdx} className={`p-2.5 rounded-lg border text-xs flex items-center space-x-2.5 ${optStyle}`}>
+                              <span className="w-5 h-5 rounded bg-slate-800 text-white flex items-center justify-center font-bold text-[10px]">
+                                {String.fromCharCode(65 + oIdx)}
+                              </span>
+                              <span>{opt}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      <div className="bg-slate-900/60 p-3 rounded-lg border border-slate-800 text-xs text-slate-300 space-y-1">
+                        <p className="font-bold text-emerald-400 uppercase text-[10px]">Explanation</p>
+                        <p>{q.explanation}</p>
+                      </div>
+                    </div>
+                  );
+                })
+              ) : (
+                <p className="text-slate-400 text-sm py-8 text-center">Question details were not saved for this legacy attempt.</p>
+              )}
+            </div>
+
+            <div className="flex justify-end pt-2 border-t border-slate-800">
+              <button
+                onClick={() => setViewingAttemptModal(null)}
+                className="px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs"
+              >
+                Close Question Set
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Settings Modal (Gemini API Key + System Logs Console with HTTP Status and Filter) */}
       {settingsOpen && (
