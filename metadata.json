@@ -1,0 +1,8 @@
+{
+  "name": "PET-10 Mechanical Exam Prep",
+  "description": "Ph.D. Entrance Exam Prep web application for Punyashlok Ahilyadevi Holkar Solapur University (PET-9 Paper 1 & Paper 2 Mechanical Engineering)",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
